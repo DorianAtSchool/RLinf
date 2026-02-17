@@ -27,6 +27,9 @@ class _TensorboardLogger:
         for key, value in data.items():
             self.writer.add_scalar(key, value, step)
 
+    def log_text(self, tag: str, text: str, step: int) -> None:
+        self.writer.add_text(tag, text, step)
+
     def finish(self):
         self.writer.close()
 
@@ -105,6 +108,12 @@ class MetricLogger:
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
+
+    def log_text(self, tag, text, step, backend=None):
+        for default_backend, logger_instance in self.logger.items():
+            if backend is None or default_backend in backend:
+                if hasattr(logger_instance, "log_text"):
+                    logger_instance.log_text(tag=tag, text=text, step=step)
 
     def log_table(self, df_data, name, step):
         if "wandb" in self.logger_backends:

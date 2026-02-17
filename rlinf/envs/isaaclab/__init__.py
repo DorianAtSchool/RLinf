@@ -13,9 +13,12 @@
 # limitations under the License.
 
 from .tasks.stack_cube import IsaaclabStackCubeEnv
+from .tasks.ma_vla_lab_configurable import IsaaclabConfigurableEnv
 
 REGISTER_ISAACLAB_ENVS = {
     "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
+    # Generic adapter — works with ANY ma-vla-lab YAML config
+    "Isaac-MA-VLA-Lab-Configurable-v0": IsaaclabConfigurableEnv,
 }
 
 __all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]

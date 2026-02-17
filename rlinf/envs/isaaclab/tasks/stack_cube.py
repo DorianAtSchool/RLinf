@@ -48,6 +48,15 @@ class IsaaclabStackCubeEnv(IsaaclabBaseEnv):
             # Remove DISPLAY variable to force headless mode and avoid GLX errors
             os.environ.pop("DISPLAY", None)
 
+            # Clear stale ISAAC_PATH env vars that may have been inherited
+            # from run_embodiment.sh (placeholder /path/to/isaac-sim)
+            for _var in ("ISAAC_PATH", "EXP_PATH", "CARB_APP_PATH"):
+                _val = os.environ.get(_var, "")
+                if "/path/to/" in _val or (
+                    _val and not os.path.isdir(_val)
+                ):
+                    os.environ.pop(_var, None)
+
             from isaaclab.app import AppLauncher
 
             sim_app = AppLauncher(headless=True, enable_cameras=True).app

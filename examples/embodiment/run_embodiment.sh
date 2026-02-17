@@ -17,8 +17,16 @@ export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATASET_PATH:-$OMNIGIBSON_DATA_PATH/
 export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_KEY_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson.key}
 export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_ASSET_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson-robot-assets/}
 export OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-1}
-# Base path to Isaac Sim, only required when running the behavior experiment.
-export ISAAC_PATH=${ISAAC_PATH:-/path/to/isaac-sim}
+# Base path to Isaac Sim.  Auto-detect from the pip-installed isaacsim package
+# so that bootstrap_kernel() / expose_api() find the SimulationApp extension.
+if [ -z "${ISAAC_PATH}" ] || [ "${ISAAC_PATH}" = "/path/to/isaac-sim" ]; then
+    _DETECTED_ISAAC_PATH=$(python -c "import importlib.util, os; s=importlib.util.find_spec('isaacsim'); print(os.path.dirname(s.origin) if s else '')" 2>/dev/null)
+    if [ -n "${_DETECTED_ISAAC_PATH}" ]; then
+        export ISAAC_PATH="${_DETECTED_ISAAC_PATH}"
+    else
+        unset ISAAC_PATH   # let isaacsim bootstrap_kernel() set it itself
+    fi
+fi
 export EXP_PATH=${EXP_PATH:-$ISAAC_PATH/apps}
 export CARB_APP_PATH=${CARB_APP_PATH:-$ISAAC_PATH/kit}
 

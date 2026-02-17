@@ -49,7 +49,7 @@ class IsaaclabBaseEnv(gym.Env):
         self._init_isaaclab_env()
         self.device = self.env.device()
 
-        self.task_description = cfg.init_params.task_description
+        self.task_description = cfg.init_params.get("task_description", "")
         self._is_start = True  # if this is first time for simulator
         self.auto_reset = cfg.auto_reset
         self.prev_step_reward = torch.zeros(self.num_envs).to(self.device)

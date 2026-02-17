@@ -584,7 +584,9 @@ install_behavior_env() {
     uv pip install ml_dtypes==0.5.3 protobuf==3.20.3
     uv pip install click==8.2.1
     pushd ~ >/dev/null
-    uv pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+    # uv pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+    uv pip uninstall torch torchvision torchaudio || true
+    uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
     install_flash_attn
     popd >/dev/null
 }

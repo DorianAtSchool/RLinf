@@ -1,0 +1,35 @@
+# Generic environment config for ma-vla-lab configurable environments.
+# Works with ANY ma-vla-lab YAML config — change init_params.config_path to switch tasks.
+# Modeled after config/env/isaaclab_stack_cube.yaml
+
+env_type: isaaclab
+total_num_envs: null           # overridden per training profile
+auto_reset: False
+ignore_terminations: False
+use_rel_reward: False          # Isaac Lab rewards are already absolute
+seed: 0
+group_size: 1
+reward_coef: 1.0
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 250
+max_episode_steps: 250
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  fps: 20
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: "Isaac-MA-VLA-Lab-Configurable-v0"
+  num_envs: null
+  max_episode_steps: ${env.train.max_episode_steps}
+  # --- Change this ONE line to switch tasks ---
+  config_path: "/home/dorian/Projects/isaaclab/ma-vla-lab/configs/foundation/pick_place_eval.yaml"
+  robot_id: null               # auto-detect first robot
+  table_cam:
+    height: 224
+    width: 224
+  wrist_cam:
+    height: 224
+    width: 224
