@@ -267,7 +267,14 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
 
             from isaaclab.app import AppLauncher
 
-            sim_app = AppLauncher(headless=headless, enable_cameras=True).app
+            # Force single-GPU Omniverse mode in RLinf worker subprocesses.
+            # This avoids unstable multi-GPU Vulkan paths on systems with mixed ICD setups.
+            sim_app = AppLauncher(
+                headless=headless,
+                enable_cameras=True,
+                device="cuda:0",
+                multi_gpu=False,
+            ).app
 
             from isaaclab.envs import ManagerBasedRLEnv
             from ma_vla_lab.config import load_environment_config
@@ -471,7 +478,9 @@ class _PromptTargetWrapper:
         self._env_config = env_config
         self._robot_id = robot_id
         self._robot_ids = list(robot_ids) if robot_ids else [robot_id]
-        self._sample_control_robot = bool(sample_control_robot and len(self._robot_ids) > 1)
+        self._sample_control_robot_enabled = bool(
+            sample_control_robot and len(self._robot_ids) > 1
+        )
         self._object_ids = object_ids
         self._num_envs = env.num_envs
         self._settle_seconds = float(settle_seconds)
@@ -549,7 +558,7 @@ class _PromptTargetWrapper:
     def _sample_control_robot(self, idx: int):
         import random as _random
 
-        if self._sample_control_robot and self._robot_ids:
+        if self._sample_control_robot_enabled and self._robot_ids:
             rid = _random.choice(self._robot_ids)
         else:
             rid = self._robot_id
@@ -570,6 +579,66 @@ class _PromptTargetWrapper:
     def _resample_episode(self, idx: int):
         self._sample_control_robot(idx)
         self._sample_target_prompt(idx)
+
+    def _active_termination_keys_from_info(self, info: dict, env_idx: int) -> list[str]:
+        term_info = info.get("termination_info", {}) if isinstance(info, dict) else {}
+        active = []
+        for key, value in term_info.items():
+            try:
+                term_tensor = torch.as_tensor(value)
+                if term_tensor.ndim == 0:
+                    hit = bool(term_tensor.item())
+                elif env_idx < term_tensor.shape[0]:
+                    hit = bool(torch.as_tensor(term_tensor[env_idx]).any().item())
+                else:
+                    hit = bool(term_tensor.any().item())
+                if hit:
+                    active.append(key)
+            except Exception:
+                continue
+        return active
+
+    def _active_termination_keys_from_manager(self, env_idx: int) -> list[str]:
+        manager = getattr(self._env, "termination_manager", None)
+        if manager is None and hasattr(self._env, "unwrapped"):
+            manager = getattr(self._env.unwrapped, "termination_manager", None)
+        if manager is None:
+            return []
+
+        active = []
+        term_names = getattr(manager, "_term_names", None)
+        term_dones = getattr(manager, "_term_dones", None)
+        if term_names is not None and term_dones is not None:
+            try:
+                for term_name, term_done in zip(term_names, term_dones):
+                    if bool(torch.as_tensor(term_done[env_idx]).any().item()):
+                        active.append(str(term_name))
+                if active:
+                    return active
+            except Exception:
+                pass
+
+        for term_name in getattr(manager, "active_terms", []):
+            try:
+                term_val = manager.get_term(term_name)
+                if bool(torch.as_tensor(term_val[env_idx]).any().item()):
+                    active.append(str(term_name))
+            except Exception:
+                continue
+        return active
+
+    def _classify_episode_result(self, info: dict, env_idx: int, terminated: bool, truncated: bool):
+        active_terms = self._active_termination_keys_from_info(info, env_idx)
+        source = "info"
+        if not active_terms:
+            active_terms = self._active_termination_keys_from_manager(env_idx)
+            source = "manager"
+
+        success_hit = any(k == "success" or k.startswith("success_") for k in active_terms)
+        failure_hit = any(k == "failure" or k.startswith("failure_") for k in active_terms)
+        unknown_hit = (terminated or truncated) and not (success_hit or failure_hit)
+        classified_success = success_hit and not failure_hit
+        return classified_success, success_hit, failure_hit, unknown_hit, active_terms, source
 
     def reset(self, seed=None, env_ids=None):
         obs, info = self._env.reset(seed=seed, env_ids=env_ids)
@@ -607,6 +676,31 @@ class _PromptTargetWrapper:
         # for those new episodes immediately to keep rollout state synchronized.
         done_mask = torch.logical_or(terminated, truncated)
         reset_ids = done_mask.nonzero(as_tuple=True)[0].tolist()
+
+        # Print termination cause for each env before we sample next-episode metadata.
+        for idx in reset_ids:
+            term_flag = bool(torch.as_tensor(terminated[idx]).item())
+            trunc_flag = bool(torch.as_tensor(truncated[idx]).item())
+            (
+                classified_success,
+                success_hit,
+                failure_hit,
+                unknown_hit,
+                active_terms,
+                term_source,
+            ) = self._classify_episode_result(info, idx, term_flag, trunc_flag)
+
+            robot_id = self._controlled_robot_ids[idx]
+            target = self._env.target_object_names[idx]
+            reward_val = float(torch.as_tensor(reward[idx]).item())
+            print(
+                f"[PromptTargetWrapper][TERM] env={idx} robot={robot_id} target={target} "
+                f"reward={reward_val:.4f} terminated={term_flag} truncated={trunc_flag} "
+                f"active={active_terms} source={term_source} "
+                f"classified_success={classified_success} success_hit={success_hit} "
+                f"failure_hit={failure_hit} unknown_hit={unknown_hit}"
+            )
+
         for idx in reset_ids:
             self._resample_episode(idx)
         # Include current prompts in obs for the adapter

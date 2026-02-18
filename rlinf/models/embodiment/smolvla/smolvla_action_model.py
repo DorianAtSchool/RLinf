@@ -396,11 +396,12 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
                 value_t = torch.zeros(bsize, device=device)
             values_list.append(value_t)
 
-            sampled_step_mask = (
-                mode == "train"
-                and self.noise_method == "flow_sde"
-                and (denoise_inds[:, step_idx] == step_idx)
-            )
+            if mode == "train" and self.noise_method == "flow_sde":
+                sampled_step_mask = denoise_inds[:, step_idx] == step_idx
+            else:
+                sampled_step_mask = torch.zeros(
+                    bsize, dtype=torch.bool, device=device
+                )
 
             if sampled_step_mask.any():
                 # SDE noise injection
