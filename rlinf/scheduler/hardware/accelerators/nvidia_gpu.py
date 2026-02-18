@@ -115,7 +115,6 @@ class NvidiaGPUManager(AcceleratorManager):
 
         # NCCL env vars
         env_vars["NCCL_CUMEM_ENABLE"] = "0"
-        env_vars["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
         if os.environ.get("NCCL_CUMEM_ENABLE", "0") != "0":
             warnings.warn(
                 f"NCCL_CUMEM_ENABLE is set to {os.environ['NCCL_CUMEM_ENABLE']}. However, "

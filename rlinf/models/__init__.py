@@ -36,6 +36,8 @@ def get_model(cfg: DictConfig):
         from rlinf.models.embodiment.cnn_policy import get_model
     elif model_type == SupportedModel.FLOW_POLICY:
         from rlinf.models.embodiment.flow_policy import get_model
+    elif model_type == SupportedModel.SMOLVLA:
+        from rlinf.models.embodiment.smolvla import get_model
     else:
         return None
 
@@ -79,6 +81,34 @@ def get_model(cfg: DictConfig):
                 tag_vlm_subtree(model, False)
                 tag_vlm_subtree(module_to_lora, True)
                 model.paligemma_with_expert.paligemma = module_to_lora
+            elif model_type == SupportedModel.SMOLVLA:
+                # SmolVLA: LoRA on VLM + expert attention/FFN layers only.
+                # Standalone projections (state_proj, action_*_proj, action_time_mlp_*)
+                # are small enough to train fully and cause FSDP double-wrap if LoRA'd.
+                smolvla_lora_config = LoraConfig(
+                    r=cfg.lora_rank,
+                    lora_alpha=cfg.lora_rank,
+                    lora_dropout=0.0,
+                    target_modules=[
+                        "q_proj", "k_proj", "v_proj", "o_proj",  # LLM + expert attn
+                        "gate_proj", "up_proj", "down_proj",      # LLM FFN
+                        "out_proj", "fc1", "fc2",                 # vision encoder
+                    ],
+                    init_lora_weights="gaussian",
+                )
+                model = get_peft_model(model, smolvla_lora_config)
+                # Tag all modules _to_lora=False so FSDP LoRA lambda policy
+                # doesn't individually wrap leaf modules (avoids double-wrap).
+                # LoRA adapters inside transformer blocks are already handled
+                # by the transformer_auto_wrap_policy (LlamaDecoderLayer).
+                tag_vlm_subtree(model, False)
+                # Unfreeze standalone projection layers for full fine-tuning
+                for name, param in model.named_parameters():
+                    if any(p in name for p in [
+                        "state_proj", "action_in_proj", "action_out_proj",
+                        "action_time_mlp_in", "action_time_mlp_out",
+                    ]):
+                        param.requires_grad = True
             else:
                 model = get_peft_model(model, lora_config)
         else:
@@ -87,6 +117,13 @@ def get_model(cfg: DictConfig):
         if hasattr(model, "value_head"):
             for param in model.value_head.parameters():
                 param.requires_grad = True
+
+        # SmolVLA: unify all param dtypes to bfloat16 for FSDP compatibility
+        # (LoRA adapters init as float32; base weights are bfloat16)
+        if model_type == SupportedModel.SMOLVLA:
+            for param in model.parameters():
+                if param.dtype == torch.float32:
+                    param.data = param.data.to(torch.bfloat16)
 
     return model
 

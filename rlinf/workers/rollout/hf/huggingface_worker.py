@@ -72,6 +72,7 @@ class MultiStepRolloutWorker(Worker):
             self.total_num_eval_envs // self._world_size // self.num_pipeline_stages
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
+        self.log_episode_prompts = cfg.rollout.get("log_episode_prompts", False)
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -144,6 +145,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.CNN_POLICY,
+            SupportedModel.SMOLVLA,
         ]:
             kwargs = {"mode": mode}
 
@@ -238,6 +240,43 @@ class MultiStepRolloutWorker(Worker):
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
 
+    def _maybe_log_episode_prompts(
+        self,
+        env_output: dict[str, torch.Tensor],
+        dones: torch.Tensor | None,
+        stage_id: int,
+        print_start: bool = False,
+    ):
+        if not self.log_episode_prompts or self._rank != 0:
+            return
+
+        obs = env_output.get("obs", None)
+        if obs is None:
+            return
+        prompts = obs.get("task_descriptions", None)
+        if prompts is None:
+            return
+
+        prompt_list = list(prompts)
+        if print_start:
+            for env_id, prompt in enumerate(prompt_list):
+                print(
+                    f"[RolloutPrompt][stage={stage_id}][env={env_id}][start] {prompt!r}"
+                )
+
+        if dones is None:
+            return
+        if dones.ndim == 2:
+            done_env_mask = dones.any(dim=1)
+        else:
+            done_env_mask = dones
+        done_ids = done_env_mask.nonzero(as_tuple=True)[0].tolist()
+        for env_id in done_ids:
+            print(
+                f"[RolloutPrompt][stage={stage_id}][env={env_id}][next_episode] "
+                f"{prompt_list[env_id]!r}"
+            )
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         n_chunk_steps = (
@@ -246,6 +285,7 @@ class MultiStepRolloutWorker(Worker):
         )
 
         last_obs = [None for i in range(self.num_pipeline_stages)]
+        printed_start_prompts = [False for _ in range(self.num_pipeline_stages)]
         for _ in range(n_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
@@ -257,6 +297,13 @@ class MultiStepRolloutWorker(Worker):
                     )
 
                 dones, rewards = self.get_dones_and_rewards(env_output)
+                self._maybe_log_episode_prompts(
+                    env_output,
+                    dones,
+                    stage_id,
+                    print_start=(not printed_start_prompts[stage_id]),
+                )
+                printed_start_prompts[stage_id] = True
 
                 actions, result = self.predict(env_output["obs"])
 

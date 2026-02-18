@@ -50,10 +50,14 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         self.config_path = cfg.init_params.config_path
         self.robot_id = cfg.init_params.get("robot_id", None)
+        self.sample_control_robot = bool(
+            cfg.init_params.get("sample_control_robot", False)
+        )
 
         # Populated during _make_env_function by pre-parsing the YAML
         self._wrist_obs_key = None   # obs key for wrist camera image
         self._table_obs_key = None   # obs key for table/scene camera image
+        self._side_obs_key = None    # obs key for side/corner camera image
         self._ee_obs_key = None      # obs key for ee_pose (7D: pos + quat_wxyz)
         self._gripper_joint_ids = None
 
@@ -61,6 +65,10 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         self._action_dim_full = None
         self._arm_slice = None       # (start, end) into full action tensor
         self._gripper_idx = None     # index of gripper action
+        self._action_map_by_robot = {}  # robot_id -> {"arm_slice": tuple | None, "gripper_idx": int | None}
+        self._robot_ids = []
+        self._obs_group_name_by_robot = {}
+        self._controlled_robot_ids = None  # list[str] length num_envs
 
         # Prompt state — updated on each reset from subprocess info dict
         self._current_prompts = None  # list[str] of length num_envs
@@ -122,18 +130,26 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         robot_id = self.robot_id
 
         # Discover camera names by semantic type
-        wrist_cam_name = None
+        wrist_cam_names = []
+        wrist_cam_name_by_robot = {}
         table_cam_name = None
+        side_cam_name = None
         for e in entities:
             if e.entity_type == "wrist_camera":
-                if robot_id is not None and e.properties.get("robot_id") == robot_id:
-                    wrist_cam_name = e.name
-                elif wrist_cam_name is None:
-                    wrist_cam_name = e.name
+                wrist_cam_names.append(e.name)
+                _rid = e.properties.get("robot_id")
+                if _rid is not None:
+                    wrist_cam_name_by_robot[_rid] = e.name
             elif e.entity_type == "table_camera" and table_cam_name is None:
                 table_cam_name = e.name
-            elif e.entity_type == "scene_camera" and table_cam_name is None:
-                table_cam_name = e.name
+            elif e.entity_type == "scene_camera":
+                if table_cam_name is None:
+                    table_cam_name = e.name
+                elif side_cam_name is None:
+                    # Second scene camera becomes the side camera
+                    side_cam_name = e.name
+
+        robot_names = [e.name for e in entities if e.entity_type == "robot"]
 
         # Auto-detect robot if not specified
         if robot_id is None:
@@ -141,20 +157,37 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
                 if e.entity_type == "robot":
                     robot_id = e.name
                     break
+            if len(robot_names) > 1:
+                print(
+                    "[IsaaclabConfigurableEnv] init_params.robot_id is unset; "
+                    f"defaulting to first robot '{robot_id}' from {robot_names}."
+                )
         self.robot_id = robot_id
+        self._robot_ids = list(robot_names) if robot_names else ([robot_id] if robot_id else [])
+        if self.sample_control_robot and len(self._robot_ids) <= 1:
+            self.sample_control_robot = False
+        if robot_id and robot_id not in self._robot_ids:
+            self._robot_ids = [robot_id] + self._robot_ids
 
         # Map scene camera names → observation term keys
         self._wrist_obs_key = "wrist_rgb"
         if table_cam_name is not None:
             self._table_obs_key = f"{table_cam_name}_rgb"
+        if side_cam_name is not None:
+            self._side_obs_key = f"{side_cam_name}_rgb"
         self._ee_obs_key = "ee_pose"
 
         # Store scene camera names for resolution overrides in subprocess
-        self._wrist_cam_scene_name = wrist_cam_name
+        self._wrist_cam_scene_name = wrist_cam_name_by_robot.get(robot_id)
+        self._wrist_cam_scene_names = wrist_cam_names
         self._table_cam_scene_name = table_cam_name
+        self._side_cam_scene_name = side_cam_name
 
-        # Determine the observation group name (policy_<robot_id>)
+        # Determine observation group names (policy_<robot_id>)
         self._obs_group_name = f"policy_{robot_id}"
+        self._obs_group_name_by_robot = {
+            rid: f"policy_{rid}" for rid in self._robot_ids
+        }
 
         # Store object IDs for random target selection in subprocess
         self._object_ids = [obj.id for obj in env_config.objects]
@@ -169,13 +202,19 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
                 "joint_position": 7,
                 "gripper": 1,
             }.get(ad.action_type, 0)
-            if ad.robot_id == robot_id:
+            if ad.robot_id is not None:
+                m = self._action_map_by_robot.setdefault(
+                    ad.robot_id, {"arm_slice": None, "gripper_idx": None}
+                )
                 if ad.action_type != "gripper":
-                    self._arm_slice = (offset, offset + dim)
+                    m["arm_slice"] = (offset, offset + dim)
                 else:
-                    self._gripper_idx = offset
+                    m["gripper_idx"] = offset
             offset += dim
         self._action_dim_full = offset
+        robot_action_map = self._action_map_by_robot.get(robot_id, {})
+        self._arm_slice = robot_action_map.get("arm_slice")
+        self._gripper_idx = robot_action_map.get("gripper_idx")
 
     def _make_env_function(self):
         """Factory that boots Isaac Sim + builds env from any YAML config.
@@ -187,7 +226,9 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         config_path = self.config_path
         num_envs = self.cfg.init_params.num_envs
         robot_id = self.robot_id
+        robot_ids = self._robot_ids
         object_ids = self._object_ids
+        env_seed = int(self.seed)
 
         # Camera resolution overrides from init_params
         cam_h = None
@@ -195,16 +236,22 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         if hasattr(self.cfg.init_params, "table_cam"):
             cam_h = self.cfg.init_params.table_cam.height
             cam_w = self.cfg.init_params.table_cam.width
+        settle_seconds = float(getattr(self.cfg.init_params, "settle_seconds", 0.0))
 
         # Names discovered during pre-parse
         wrist_cam_name = self._wrist_cam_scene_name
+        wrist_cam_names = self._wrist_cam_scene_names
         table_cam_name = self._table_cam_scene_name
+        side_cam_name = self._side_cam_scene_name
+
+        headless = getattr(self.cfg.init_params, "headless", True)
 
         def make_env_isaaclab():
             import os
 
             # Force headless (avoid GLX errors in subprocess)
-            os.environ.pop("DISPLAY", None)
+            if headless:
+                os.environ.pop("DISPLAY", None)
 
             # ── Fix stale ISAAC_PATH env vars ───────────────────────────
             # run_embodiment.sh may export ISAAC_PATH=/path/to/isaac-sim
@@ -220,7 +267,7 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
 
             from isaaclab.app import AppLauncher
 
-            sim_app = AppLauncher(headless=True, enable_cameras=True).app
+            sim_app = AppLauncher(headless=headless, enable_cameras=True).app
 
             from isaaclab.envs import ManagerBasedRLEnv
             from ma_vla_lab.config import load_environment_config
@@ -229,10 +276,15 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
             )
 
             env_cfg = build_env_cfg(config_path, num_envs=num_envs)
+            # Set seed at env construction to avoid Isaac Lab's non-determinism warning.
+            env_cfg.seed = env_seed
 
             # Override camera resolution if requested
             if cam_h is not None and cam_w is not None:
-                for scene_cam_name in [wrist_cam_name, table_cam_name]:
+                scene_cam_names = []
+                scene_cam_names.extend(wrist_cam_names)
+                scene_cam_names.extend([wrist_cam_name, table_cam_name, side_cam_name])
+                for scene_cam_name in scene_cam_names:
                     if scene_cam_name and hasattr(env_cfg.scene, scene_cam_name):
                         scene_cam_cfg = getattr(env_cfg.scene, scene_cam_name)
                         scene_cam_cfg.height = cam_h
@@ -245,7 +297,13 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
 
             # Wrap to handle target selection + prompt generation
             env = _PromptTargetWrapper(
-                inner_env, env_config, robot_id, object_ids
+                inner_env,
+                env_config,
+                robot_id,
+                robot_ids,
+                object_ids,
+                settle_seconds,
+                self.sample_control_robot,
             )
             return env, sim_app
 
@@ -258,6 +316,8 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         if self._current_prompts is None:
             # First reset — initialize with num_envs copies
             self._current_prompts = [""] * self.num_envs
+        if self._controlled_robot_ids is None:
+            self._controlled_robot_ids = [self.robot_id] * self.num_envs
         return obs, infos
 
     def step(self, actions=None, auto_reset=True):
@@ -273,12 +333,21 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
                 full = torch.zeros(
                     actions.shape[0], self._action_dim_full, device=actions.device
                 )
-                if self._arm_slice is not None:
-                    arm_start, arm_end = self._arm_slice
-                    arm_dim = arm_end - arm_start
-                    full[:, arm_start:arm_end] = actions[:, :arm_dim]
-                if self._gripper_idx is not None:
-                    full[:, self._gripper_idx] = actions[:, -1]
+                controlled_ids = self._controlled_robot_ids or [self.robot_id] * actions.shape[0]
+                for rid in sorted(set(controlled_ids)):
+                    mapping = self._action_map_by_robot.get(rid, {})
+                    arm_slice = mapping.get("arm_slice")
+                    gripper_idx = mapping.get("gripper_idx")
+                    row_ids = [i for i, x in enumerate(controlled_ids) if x == rid]
+                    if not row_ids:
+                        continue
+                    row_idx = torch.as_tensor(row_ids, device=actions.device, dtype=torch.long)
+                    if arm_slice is not None:
+                        arm_start, arm_end = arm_slice
+                        arm_dim = arm_end - arm_start
+                        full[row_idx, arm_start:arm_end] = actions[row_idx, :arm_dim]
+                    if gripper_idx is not None:
+                        full[row_idx, gripper_idx] = actions[row_idx, -1]
                 actions = full
         return super().step(actions, auto_reset=auto_reset)
 
@@ -292,7 +361,32 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
                               (both fingers from same gripper, absolute joint_pos [0..0.04])
             task_descriptions: list[str] of length B
         """
-        policy_obs = obs[self._obs_group_name]
+        controlled_ids = obs.get("__controlled_robot_ids")
+        if controlled_ids is None:
+            controlled_ids = self._controlled_robot_ids or [self.robot_id] * self.num_envs
+        else:
+            controlled_ids = list(controlled_ids)
+            self._controlled_robot_ids = list(controlled_ids)
+
+        def _select_policy_term(term_key):
+            # Fast path: all envs use one robot this step.
+            if len(set(controlled_ids)) == 1:
+                rid = controlled_ids[0]
+                group_name = self._obs_group_name_by_robot.get(rid, self._obs_group_name)
+                return obs[group_name].get(term_key)
+
+            out = None
+            for rid in sorted(set(controlled_ids)):
+                group_name = self._obs_group_name_by_robot.get(rid, self._obs_group_name)
+                term = obs[group_name].get(term_key)
+                if term is None:
+                    continue
+                if out is None:
+                    out = torch.zeros_like(term)
+                row_ids = [i for i, x in enumerate(controlled_ids) if x == rid]
+                row_idx = torch.as_tensor(row_ids, device=term.device, dtype=torch.long)
+                out[row_idx] = term[row_idx]
+            return out
 
         # Prompts come from the subprocess wrapper via the info dict.
         # They are extracted in _wrap_obs_and_info and cached in
@@ -304,43 +398,48 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
         instruction = self._current_prompts or [""] * self.num_envs
 
         # Camera images
-        wrist_image = policy_obs.get(self._wrist_obs_key)
+        wrist_image = _select_policy_term(self._wrist_obs_key)
         table_image = (
-            policy_obs.get(self._table_obs_key) if self._table_obs_key else None
+            _select_policy_term(self._table_obs_key) if self._table_obs_key else None
+        )
+        side_image = (
+            _select_policy_term(self._side_obs_key) if self._side_obs_key else None
         )
 
-        # EE state: ee_pose returns 7D [pos(3), quat_wxyz(4)]
-        ee_pose = policy_obs.get(self._ee_obs_key)
-        if ee_pose is not None:
-            eef_pos = ee_pose[:, :3]
-            # Isaac Lab uses wxyz quaternion; convert to xyzw for quat2axisangle
-            quat_wxyz = ee_pose[:, 3:]
-            quat_xyzw = quat_wxyz[:, [1, 2, 3, 0]]
-            aa = quat2axisangle_torch(quat_xyzw)
+        # Prefer subprocess-computed VLA state that exactly matches eval_smolvla.py:
+        # [ee_pos_b(3), axis_angle(3), gripper(2)].
+        # Fallback to legacy ee_pose + joint_pos reconstruction if unavailable.
+        states = obs.get("__vla_state__")
+        if states is not None:
+            if isinstance(states, torch.Tensor):
+                states = states.to(device=self.device, dtype=torch.float32)
+            else:
+                states = torch.as_tensor(states, device=self.device, dtype=torch.float32)
         else:
-            eef_pos = torch.zeros(self.num_envs, 3, device=self.device)
-            aa = torch.zeros(self.num_envs, 3, device=self.device)
+            # EE state fallback: ee_pose returns 7D [pos(3), quat_wxyz(4)]
+            ee_pose = _select_policy_term(self._ee_obs_key)
+            if ee_pose is not None:
+                eef_pos = ee_pose[:, :3]
+                # Isaac Lab uses wxyz quaternion; convert to xyzw for quat2axisangle
+                quat_wxyz = ee_pose[:, 3:]
+                quat_xyzw = quat_wxyz[:, [1, 2, 3, 0]]
+                aa = quat2axisangle_torch(quat_xyzw)
+            else:
+                eef_pos = torch.zeros(self.num_envs, 3, device=self.device)
+                aa = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # Gripper state: two finger joints of the SAME gripper (not two robots).
-        # Franka Panda has 9 joints: 7 arm + panda_finger_joint1 + panda_finger_joint2.
-        # Each finger ranges [0, 0.04] m (0.0 = closed, 0.04 = fully open).
-        #
-        # The configurable env now provides absolute joint_pos (not joint_pos_rel),
-        # matching how the SFT training data was collected (via robot_asset.data.joint_pos
-        # in IsaacLabVLAEnv._extract_ee_state).  Norm stats confirm: q99 ≈ 0.04.
-        joint_pos = policy_obs.get("joint_pos_rel")
-        if joint_pos is not None:
-            gripper_pos = joint_pos[:, -2:]  # [B, 2] — absolute finger positions
-        else:
-            gripper_pos = torch.full(
-                (self.num_envs, 2), 0.04, device=self.device
-            )
-
-        states = torch.cat([eef_pos, aa, gripper_pos], dim=1)  # [B, 8]
+            # Gripper state: two finger joints of the SAME gripper (not two robots).
+            joint_pos = _select_policy_term("joint_pos_rel")
+            if joint_pos is not None:
+                gripper_pos = joint_pos[:, -2:]  # [B, 2]
+            else:
+                gripper_pos = torch.full((self.num_envs, 2), 0.04, device=self.device)
+            states = torch.cat([eef_pos, aa, gripper_pos], dim=1)  # [B, 8]
 
         env_obs = {
             "main_images": table_image,
             "wrist_images": wrist_image,
+            "side_images": side_image,
             "states": states,
             "task_descriptions": instruction,
         }
@@ -358,22 +457,121 @@ class _PromptTargetWrapper:
        RLinf adapter can read them without modifying the subprocess protocol.
     """
 
-    def __init__(self, env, env_config, robot_id, object_ids):
+    def __init__(
+        self,
+        env,
+        env_config,
+        robot_id,
+        robot_ids,
+        object_ids,
+        settle_seconds: float = 0.0,
+        sample_control_robot: bool = False,
+    ):
         self._env = env
         self._env_config = env_config
         self._robot_id = robot_id
+        self._robot_ids = list(robot_ids) if robot_ids else [robot_id]
+        self._sample_control_robot = bool(sample_control_robot and len(self._robot_ids) > 1)
         self._object_ids = object_ids
         self._num_envs = env.num_envs
+        self._settle_seconds = float(settle_seconds)
         # Current prompt per env
         self._prompts = [""] * self._num_envs
+        self._controlled_robot_ids = [self._robot_id] * self._num_envs
         # Expose attributes that SubProcIsaacLabEnv / IsaaclabBaseEnv need
         self.device = env.device
+        # Initialize per-env targets and cache robot state extraction indices.
+        self._env.target_object_names = [None] * self._num_envs
+        self._ee_body_idx_by_robot = {}
+        self._gripper_joint_ids_by_robot = {}
+        for rid in self._robot_ids:
+            robot_asset = self._env.scene[rid]
+            self._ee_body_idx_by_robot[rid] = robot_asset.find_bodies("panda_hand")[0][0]
+            self._gripper_joint_ids_by_robot[rid] = robot_asset.find_joints("panda_finger_joint.*")[0]
 
-    def reset(self, seed=None, env_ids=None):
+    def _extract_vla_state(self):
+        """Match eval_smolvla.py state extraction: [ee_pos_b, axis_angle, gripper]."""
+        import isaaclab.utils.math as math_utils
+
+        state = torch.zeros((self._num_envs, 8), device=self.device, dtype=torch.float32)
+        for rid in sorted(set(self._controlled_robot_ids)):
+            robot_asset = self._env.scene[rid]
+            ee_body_idx = self._ee_body_idx_by_robot[rid]
+            gripper_joint_ids = self._gripper_joint_ids_by_robot[rid]
+
+            ee_pos_w = robot_asset.data.body_pos_w[:, ee_body_idx]
+            ee_quat_w = robot_asset.data.body_quat_w[:, ee_body_idx]
+            root_pos_w = robot_asset.data.root_pos_w
+            root_quat_w = robot_asset.data.root_quat_w
+            ee_pos_b, ee_quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, ee_pos_w, ee_quat_w
+            )
+            ee_aa = math_utils.axis_angle_from_quat(ee_quat_b)
+            gripper_pos = robot_asset.data.joint_pos[:, gripper_joint_ids]
+            robot_state = torch.cat([ee_pos_b, ee_aa, gripper_pos], dim=-1).to(dtype=state.dtype)
+
+            row_ids = [i for i, x in enumerate(self._controlled_robot_ids) if x == rid]
+            row_idx = torch.as_tensor(row_ids, device=self.device, dtype=torch.long)
+            state[row_idx] = robot_state[row_idx]
+        return state
+
+    def _settle_simulation(self, obs):
+        """Advance sim with zero actions after reset to let objects settle."""
+        if self._settle_seconds <= 0:
+            return obs
+
+        settle_steps = max(1, int(round(float(self._settle_seconds) / float(self._env.step_dt))))
+        zero_actions = torch.zeros(
+            (self._env.num_envs, self._env.action_space.shape[-1]), device=self.device
+        )
+        is_rendering = self._env.sim.has_gui() or self._env.sim.has_rtx_sensors()
+
+        try:
+            self._env.action_manager.process_action(zero_actions)
+            for _ in range(settle_steps):
+                for _ in range(self._env.cfg.decimation):
+                    self._env._sim_step_counter += 1
+                    self._env.action_manager.apply_action()
+                    self._env.scene.write_data_to_sim()
+                    self._env.sim.step(render=False)
+                    if (
+                        self._env._sim_step_counter % self._env.cfg.sim.render_interval == 0
+                        and is_rendering
+                    ):
+                        self._env.sim.render()
+                    self._env.scene.update(dt=self._env.physics_dt)
+            obs = self._env.observation_manager.compute(update_history=True)
+        except Exception:
+            for _ in range(settle_steps):
+                obs, _, _, _, _ = self._env.step(zero_actions)
+        return obs
+
+    def _sample_control_robot(self, idx: int):
         import random as _random
 
+        if self._sample_control_robot and self._robot_ids:
+            rid = _random.choice(self._robot_ids)
+        else:
+            rid = self._robot_id
+        self._controlled_robot_ids[idx] = rid
+
+    def _sample_target_prompt(self, idx: int):
+        import random as _random
         from ma_vla_lab.config import resolve_prompt
 
+        robot_id = self._controlled_robot_ids[idx]
+        if self._object_ids:
+            target_id = _random.choice(self._object_ids)
+        else:
+            target_id = None
+        self._env.target_object_names[idx] = target_id
+        self._prompts[idx] = resolve_prompt(self._env_config, robot_id, target_id)
+
+    def _resample_episode(self, idx: int):
+        self._sample_control_robot(idx)
+        self._sample_target_prompt(idx)
+
+    def reset(self, seed=None, env_ids=None):
         obs, info = self._env.reset(seed=seed, env_ids=env_ids)
 
         # Determine which envs are being reset
@@ -384,33 +582,37 @@ class _PromptTargetWrapper:
 
         # Pick random target + generate prompt for each resetting env
         for idx in reset_indices:
-            if self._object_ids:
-                target_id = _random.choice(self._object_ids)
-            else:
-                target_id = None
-            # Set target on inner env so terminations can use it
-            if not hasattr(self._env, "target_object_names"):
-                self._env.target_object_names = [None] * self._num_envs
-            self._env.target_object_names[idx] = target_id
+            self._resample_episode(idx)
 
-            self._prompts[idx] = resolve_prompt(
-                self._env_config, self._robot_id, target_id
-            )
+        # Settle only on explicit/full reset to avoid perturbing live envs.
+        if env_ids is None:
+            obs = self._settle_simulation(obs)
 
         # Log prompts for debugging
         for idx in reset_indices:
+            robot_id = self._controlled_robot_ids[idx]
             target = self._env.target_object_names[idx]
-            print(f"[PromptTargetWrapper] env={idx} target={target} "
+            print(f"[PromptTargetWrapper] env={idx} robot={robot_id} target={target} "
                   f"prompt={self._prompts[idx]!r}")
 
         # Inject prompts into obs so they cross the subprocess boundary
         obs["__prompts__"] = list(self._prompts)
+        obs["__controlled_robot_ids"] = list(self._controlled_robot_ids)
+        obs["__vla_state__"] = self._extract_vla_state()
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
+        # ManagerBasedRLEnv auto-resets done envs inside step(). Refresh target/prompt
+        # for those new episodes immediately to keep rollout state synchronized.
+        done_mask = torch.logical_or(terminated, truncated)
+        reset_ids = done_mask.nonzero(as_tuple=True)[0].tolist()
+        for idx in reset_ids:
+            self._resample_episode(idx)
         # Include current prompts in obs for the adapter
         obs["__prompts__"] = list(self._prompts)
+        obs["__controlled_robot_ids"] = list(self._controlled_robot_ids)
+        obs["__vla_state__"] = self._extract_vla_state()
         return obs, reward, terminated, truncated, info
 
     def close(self):

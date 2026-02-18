@@ -160,17 +160,42 @@ class IsaaclabBaseEnv(gym.Env):
 
         raw_chunk_terminations = []
         raw_chunk_truncations = []
+        # For chunked policies (e.g., SmolVLA), once an env terminates inside a chunk,
+        # the remaining actions in that chunk are stale. Mask them out to emulate queue flush.
+        done_so_far = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=chunk_actions.device
+        )
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
+            if done_so_far.any():
+                actions = actions.clone()
+                actions[done_so_far] = 0
+
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
+
+            if done_so_far.any():
+                # Ignore rewards/termination signals produced after an env is already done
+                # in the current chunk (typically from the next auto-reset episode).
+                step_reward = step_reward.clone()
+                terminations = terminations.clone()
+                truncations = truncations.clone()
+                done_mask = done_so_far.to(step_reward.device)
+                step_reward[done_mask] = 0
+                terminations[done_mask] = False
+                truncations[done_mask] = False
+
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+
+            done_so_far = torch.logical_or(
+                done_so_far, torch.logical_or(terminations, truncations).to(done_so_far.device)
+            )
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(

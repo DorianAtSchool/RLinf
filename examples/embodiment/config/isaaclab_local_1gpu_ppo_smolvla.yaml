@@ -1,0 +1,167 @@
+# Local 1-GPU training profile for SmolVLA pick-and-place.
+# RTX 5090 (32GB) — SmolVLA is ~600M params, fits easily with LoRA.
+#
+# Usage:
+#   source /home/dorian/Projects/isaaclab/.mavla/bin/activate
+#   cd /home/dorian/Projects/isaaclab/external/RLinf
+#   export EMBODIED_PATH=$(pwd)/examples/embodiment
+#   bash examples/embodiment/run_embodiment.sh isaaclab_local_1gpu_ppo_smolvla
+
+defaults:
+  - env/isaaclab_ma_vla_lab@env.train
+  - env/isaaclab_ma_vla_lab@env.eval
+  - model/smolvla@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# === SINGLE GPU — ALL COLLOCATED ===
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all     # everything on GPU 0
+
+runner:
+  task_type: embodied
+  seed: 42
+  only_eval: False
+  eval_policy_path: null
+  max_prompt_length: 30
+  max_epochs: 200
+  max_steps: -1
+  val_check_interval: 0
+  save_interval: 20
+  logger:
+    log_path: "../results"
+    project_name: rlinf-ma-vla-lab
+    experiment_name: "local_smolvla_pick_place_lora"
+    logger_backends: ["tensorboard"]
+
+algorithm:
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 2
+  eval_rollout_epoch: 2
+
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+
+  update_epoch: 2
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  filter_rewards: False
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+  train:
+    init_params:
+      sample_control_robot: True
+    total_num_envs: 2
+    max_episode_steps: 250
+    max_steps_per_rollout_epoch: 250
+    use_fixed_reset_state_ids: True
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/train
+  eval:
+    total_num_envs: 1
+    auto_reset: False
+    ignore_terminations: True
+    max_episode_steps: 250
+    max_steps_per_rollout_epoch: 250
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    group_size: 1
+    is_eval: True
+    video_cfg:
+      save_video: True
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  enable_offload: True
+  pipeline_stage_num: 1
+  log_episode_prompts: True
+
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2
+  global_batch_size: 10
+  seed: 42
+  enable_offload: True
+
+  model:
+    add_value_head: True
+    is_lora: True
+    lora_rank: 32
+    smolvla:
+      noise_level: 0.0
+      noise_method: "flow_sde"
+      joint_logprob: False
+      value_after_vlm: True
+      value_vlm_mode: "mean_token"
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    use_orig_params: True
+    disable: True
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

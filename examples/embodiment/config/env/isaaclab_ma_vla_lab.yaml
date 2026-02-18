@@ -24,6 +24,9 @@ init_params:
   id: "Isaac-MA-VLA-Lab-Configurable-v0"
   num_envs: null
   max_episode_steps: ${env.train.max_episode_steps}
+  headless: True
+  settle_seconds: 0.5
+  sample_control_robot: False   # if true, randomize controlled robot on each env reset
   # --- Change this ONE line to switch tasks ---
   config_path: "/home/dorian/Projects/isaaclab/ma-vla-lab/configs/foundation/pick_place_eval.yaml"
   robot_id: null               # auto-detect first robot
