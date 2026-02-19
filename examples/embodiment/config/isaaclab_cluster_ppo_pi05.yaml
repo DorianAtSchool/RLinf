@@ -132,12 +132,13 @@ actor:
 
   model:
     model_path: "checkpoints/pi05_rlinf_pick_place"
-    num_action_chunks: 10
+    num_action_chunks: 50
     add_value_head: True
     is_lora: True
     lora_rank: 64
     openpi:
       config_name: "pi05_libero"
+      action_horizon: 50
       num_images_in_input: 2
       noise_level: 0.5
       noise_method: "flow_sde"

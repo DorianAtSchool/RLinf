@@ -315,7 +315,7 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
         values_list = []
 
         # Noise schedule for SDE
-        noise_level = torch.tensor(self.noise_level, device=device, dtype=model_dtype)
+        noise_level = torch.tensor(self.noise_level, device=device, dtype=torch.float32)
 
         # Denoise index selection (same pattern as OpenPI)
         if mode == "train":
@@ -341,7 +341,7 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
         for step_idx in range(num_steps):
             time = 1.0 + step_idx * dt
             time_tensor = torch.tensor(
-                time, dtype=model_dtype, device=device
+                time, dtype=torch.float32, device=device
             ).expand(bsize)
 
             # Get velocity prediction
@@ -543,7 +543,7 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
         num_steps = self.num_steps
         chunk_size = self.flow_model.config.chunk_size
         model_dtype = next(self.parameters()).dtype
-        noise_level = torch.tensor(self.noise_level, device=device, dtype=model_dtype)
+        noise_level = torch.tensor(self.noise_level, device=device, dtype=torch.float32)
 
         chains_log_probs = []
         chains_values = []
@@ -562,7 +562,7 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
 
             # Time for this denoising step
             dt = -1.0 / num_steps
-            time_vals = 1.0 + denoise_ind.to(dtype=model_dtype) * dt
+            time_vals = 1.0 + denoise_ind.to(dtype=torch.float32) * dt
             time_tensor = time_vals.to(device)
 
             # Get velocity
@@ -579,10 +579,10 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
 
             if self.noise_method == "flow_sde":
                 timesteps = torch.linspace(
-                    1, 1 / num_steps, num_steps, device=device, dtype=model_dtype
+                    1, 1 / num_steps, num_steps, device=device, dtype=torch.float32
                 )
                 timesteps = torch.cat(
-                    [timesteps, torch.tensor([0.0], device=device, dtype=model_dtype)]
+                    [timesteps, torch.tensor([0.0], device=device, dtype=torch.float32)]
                 )
                 sigmas = (
                     noise_level
@@ -607,7 +607,7 @@ class SmolVLAForRLActionPrediction(nn.Module, BasePolicy):
                 )
                 x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
                 x_t_std = torch.sqrt(
-                    torch.tensor(delta, device=device, dtype=model_dtype)
+                    torch.tensor(delta, device=device, dtype=torch.float32)
                 ) * sigma_i
             else:
                 # Pure ODE

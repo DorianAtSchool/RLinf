@@ -131,7 +131,7 @@ actor:
 
   model:
     model_path: "/home/dorian/Projects/isaaclab/checkpoints/pi05_rlinf_pick_place"
-    num_action_chunks: 10
+    num_action_chunks: 50
     add_value_head: True
     # === LoRA (REQUIRED for 32GB RTX 5090) ===
     is_lora: True
@@ -139,6 +139,7 @@ actor:
     # openpi specific
     openpi:
       config_name: "pi05_libero"
+      action_horizon: 50
       num_images_in_input: 2   # main + wrist
       noise_level: 0.5
       noise_method: "flow_sde"

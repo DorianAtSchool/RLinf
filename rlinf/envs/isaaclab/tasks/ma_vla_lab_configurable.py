@@ -237,6 +237,7 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
             cam_h = self.cfg.init_params.table_cam.height
             cam_w = self.cfg.init_params.table_cam.width
         settle_seconds = float(getattr(self.cfg.init_params, "settle_seconds", 0.0))
+        use_termination_reward = bool(getattr(self.cfg.init_params, "use_termination_reward", False))
 
         # Names discovered during pre-parse
         wrist_cam_name = self._wrist_cam_scene_name
@@ -311,6 +312,7 @@ class IsaaclabConfigurableEnv(IsaaclabBaseEnv):
                 object_ids,
                 settle_seconds,
                 self.sample_control_robot,
+                use_termination_reward,
             )
             return env, sim_app
 
@@ -473,6 +475,7 @@ class _PromptTargetWrapper:
         object_ids,
         settle_seconds: float = 0.0,
         sample_control_robot: bool = False,
+        use_termination_reward: bool = False,
     ):
         self._env = env
         self._env_config = env_config
@@ -481,6 +484,7 @@ class _PromptTargetWrapper:
         self._sample_control_robot_enabled = bool(
             sample_control_robot and len(self._robot_ids) > 1
         )
+        self._use_termination_reward = use_termination_reward
         self._object_ids = object_ids
         self._num_envs = env.num_envs
         self._settle_seconds = float(settle_seconds)
@@ -692,6 +696,11 @@ class _PromptTargetWrapper:
 
             robot_id = self._controlled_robot_ids[idx]
             target = self._env.target_object_names[idx]
+
+            if self._use_termination_reward:
+                reward = reward.clone()
+                reward[idx] = 1.0 if classified_success else 0.0
+
             reward_val = float(torch.as_tensor(reward[idx]).item())
             print(
                 f"[PromptTargetWrapper][TERM] env={idx} robot={robot_id} target={target} "
